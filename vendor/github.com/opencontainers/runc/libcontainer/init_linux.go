@@ -3,6 +3,7 @@
 package libcontainer
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,20 +11,20 @@ import (
 	"net"
 	"os"
 	"strings"
-	"syscall" // only for Errno
 	"unsafe"
 
-	"golang.org/x/sys/unix"
-
 	"github.com/containerd/console"
+	"github.com/opencontainers/runc/libcontainer/capabilities"
 	"github.com/opencontainers/runc/libcontainer/cgroups"
 	"github.com/opencontainers/runc/libcontainer/configs"
 	"github.com/opencontainers/runc/libcontainer/system"
 	"github.com/opencontainers/runc/libcontainer/user"
 	"github.com/opencontainers/runc/libcontainer/utils"
+	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 )
 
 type initType string
@@ -68,6 +69,7 @@ type initConfig struct {
 	ConsoleHeight    uint16                `json:"console_height"`
 	RootlessEUID     bool                  `json:"rootless_euid,omitempty"`
 	RootlessCgroups  bool                  `json:"rootless_cgroups,omitempty"`
+	SpecState        *specs.State          `json:"spec_state,omitempty"`
 }
 
 type initer interface {
@@ -127,13 +129,13 @@ func finalizeNamespace(config *initConfig) error {
 		return errors.Wrap(err, "close exec fds")
 	}
 
-	capabilities := &configs.Capabilities{}
+	caps := &configs.Capabilities{}
 	if config.Capabilities != nil {
-		capabilities = config.Capabilities
+		caps = config.Capabilities
 	} else if config.Config.Capabilities != nil {
-		capabilities = config.Config.Capabilities
+		caps = config.Config.Capabilities
 	}
-	w, err := newContainerCapList(capabilities)
+	w, err := capabilities.New(caps)
 	if err != nil {
 		return err
 	}
@@ -148,16 +150,19 @@ func finalizeNamespace(config *initConfig) error {
 	if err := setupUser(config); err != nil {
 		return errors.Wrap(err, "setup user")
 	}
+	// Change working directory AFTER the user has been set up.
+	// Otherwise, if the cwd is also a volume that's been chowned to the container user (and not the user running runc),
+	// this command will EPERM.
+	if config.Cwd != "" {
+		if err := unix.Chdir(config.Cwd); err != nil {
+			return fmt.Errorf("chdir to cwd (%q) set in config.json failed: %v", config.Cwd, err)
+		}
+	}
 	if err := system.ClearKeepCaps(); err != nil {
 		return errors.Wrap(err, "clear keep caps")
 	}
 	if err := w.ApplyCaps(); err != nil {
 		return errors.Wrap(err, "apply caps")
-	}
-	if config.Cwd != "" {
-		if err := unix.Chdir(config.Cwd); err != nil {
-			return fmt.Errorf("chdir to cwd (%q) set in config.json failed: %v", config.Cwd, err)
-		}
 	}
 	return nil
 }
@@ -182,6 +187,9 @@ func setupConsole(socket *os.File, config *initConfig, mount bool) error {
 		return err
 	}
 
+	// After we return from here, we don't need the console anymore.
+	defer pty.Close()
+
 	if config.ConsoleHeight != 0 && config.ConsoleWidth != 0 {
 		err = pty.Resize(console.WinSize{
 			Height: config.ConsoleHeight,
@@ -192,9 +200,6 @@ func setupConsole(socket *os.File, config *initConfig, mount bool) error {
 			return err
 		}
 	}
-
-	// After we return from here, we don't need the console anymore.
-	defer pty.Close()
 
 	// Mount the console inside our rootfs.
 	if mount {
@@ -271,10 +276,10 @@ func setupUser(config *initConfig) error {
 	// Rather than just erroring out later in setuid(2) and setgid(2), check
 	// that the user is mapped here.
 	if _, err := config.Config.HostUID(execUser.Uid); err != nil {
-		return fmt.Errorf("cannot set uid to unmapped user in user namespace")
+		return errors.New("cannot set uid to unmapped user in user namespace")
 	}
 	if _, err := config.Config.HostGID(execUser.Gid); err != nil {
-		return fmt.Errorf("cannot set gid to unmapped user in user namespace")
+		return errors.New("cannot set gid to unmapped user in user namespace")
 	}
 
 	if config.RootlessEUID {
@@ -283,7 +288,7 @@ func setupUser(config *initConfig) error {
 		// this check earlier, but if libcontainer.Process.User was typesafe
 		// this might work.
 		if len(addGroups) > 0 {
-			return fmt.Errorf("cannot set any additional groups in a rootless container")
+			return errors.New("cannot set any additional groups in a rootless container")
 		}
 	}
 
@@ -302,7 +307,7 @@ func setupUser(config *initConfig) error {
 	// There's nothing we can do about /etc/group entries, so we silently
 	// ignore setting groups here (since the user didn't explicitly ask us to
 	// set the group).
-	allowSupGroups := !config.RootlessEUID && strings.TrimSpace(string(setgroups)) != "deny"
+	allowSupGroups := !config.RootlessEUID && string(bytes.TrimSpace(setgroups)) != "deny"
 
 	if allowSupGroups {
 		suppGroups := append(execUser.Sgids, addGroups...)
@@ -429,6 +434,7 @@ func setupRlimits(limits []configs.Rlimit, pid int) error {
 
 const _P_PID = 1
 
+//nolint:structcheck,unused
 type siginfo struct {
 	si_signo int32
 	si_errno int32
@@ -454,7 +460,7 @@ func isWaitable(pid int) (bool, error) {
 // isNoChildren returns true if err represents a unix.ECHILD (formerly syscall.ECHILD) false otherwise
 func isNoChildren(err error) bool {
 	switch err := err.(type) {
-	case syscall.Errno:
+	case unix.Errno:
 		if err == unix.ECHILD {
 			return true
 		}
@@ -478,7 +484,9 @@ func signalAllProcesses(m cgroups.Manager, s os.Signal) error {
 	}
 	pids, err := m.GetAllPids()
 	if err != nil {
-		m.Freeze(configs.Thawed)
+		if err := m.Freeze(configs.Thawed); err != nil {
+			logrus.Warn(err)
+		}
 		return err
 	}
 	for _, pid := range pids {
